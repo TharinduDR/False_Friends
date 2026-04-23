@@ -165,7 +165,7 @@ def compute_metrics(eval_pred):
 
 
 def detailed_report(predictions, label_ids, src_words_list, tgt_words_list):
-    """Print seqeval report and per-side breakdown."""
+    """Print full per-label metrics (P/R/F1), macro/micro averages, and per-side breakdown."""
     preds = np.argmax(predictions, axis=-1)
 
     all_true, all_pred = [], []
@@ -191,20 +191,60 @@ def detailed_report(predictions, label_ids, src_words_list, tgt_words_list):
             tgt_true.append(seq_labels[n_src:])
             tgt_pred.append(seq_preds[n_src:])
 
-    print("=== Overall ===")
-    print(classification_report(all_true, all_pred))
+    # Flatten for sklearn per-label metrics
+    from sklearn.metrics import classification_report as sklearn_report
+    flat_true = [l for seq in all_true for l in seq]
+    flat_pred = [l for seq in all_pred for l in seq]
 
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60)
+
+    # Per-label token-level metrics (sklearn — includes O and B-FF separately)
+    print("\n--- Token-level metrics (per label) ---")
+    print(sklearn_report(flat_true, flat_pred, digits=4, zero_division=0))
+
+    # Entity-level metrics (seqeval — evaluates B-FF spans)
+    print("--- Entity-level metrics (seqeval) ---")
+    print(classification_report(all_true, all_pred, digits=4, zero_division=0))
+
+    # Summary
+    print("--- Summary ---")
+    print(f"  Macro F1 (token-level):  {_macro_f1_token(flat_true, flat_pred):.4f}")
+    print(f"  Entity F1 (seqeval):     {f1_score(all_true, all_pred):.4f}")
+    print(f"  Entity Precision:        {precision_score(all_true, all_pred):.4f}")
+    print(f"  Entity Recall:           {recall_score(all_true, all_pred):.4f}")
+
+    # Per-side breakdown
     if src_true:
-        print("=== Source (English) side ===")
-        print(f"  F1:        {f1_score(src_true, src_pred):.4f}")
-        print(f"  Precision: {precision_score(src_true, src_pred):.4f}")
-        print(f"  Recall:    {recall_score(src_true, src_pred):.4f}")
+        print(f"\n--- Source (English) side ---")
+        print(f"  Entity F1:        {f1_score(src_true, src_pred):.4f}")
+        print(f"  Entity Precision: {precision_score(src_true, src_pred):.4f}")
+        print(f"  Entity Recall:    {recall_score(src_true, src_pred):.4f}")
 
     if tgt_true:
-        print("=== Target (Spanish) side ===")
-        print(f"  F1:        {f1_score(tgt_true, tgt_pred):.4f}")
-        print(f"  Precision: {precision_score(tgt_true, tgt_pred):.4f}")
-        print(f"  Recall:    {recall_score(tgt_true, tgt_pred):.4f}")
+        print(f"\n--- Target (Spanish) side ---")
+        print(f"  Entity F1:        {f1_score(tgt_true, tgt_pred):.4f}")
+        print(f"  Entity Precision: {precision_score(tgt_true, tgt_pred):.4f}")
+        print(f"  Entity Recall:    {recall_score(tgt_true, tgt_pred):.4f}")
+
+    print("=" * 60)
+
+    return {
+        "macro_f1_token": _macro_f1_token(flat_true, flat_pred),
+        "entity_f1": f1_score(all_true, all_pred),
+        "entity_precision": precision_score(all_true, all_pred),
+        "entity_recall": recall_score(all_true, all_pred),
+        "src_entity_f1": f1_score(src_true, src_pred) if src_true else None,
+        "tgt_entity_f1": f1_score(tgt_true, tgt_pred) if tgt_true else None,
+    }
+
+
+def _macro_f1_token(flat_true, flat_pred):
+    """Compute macro F1 at the token level across all labels."""
+    from sklearn.metrics import f1_score as sklearn_f1
+    labels = sorted(set(flat_true) | set(flat_pred))
+    return sklearn_f1(flat_true, flat_pred, labels=labels, average="macro", zero_division=0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -313,14 +353,21 @@ def train_model(
     with open(os.path.join(output_dir, "ff_config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    # Final evaluation with per-side breakdown
-    print("\n=== Evaluation on test set ===")
-    results = trainer.evaluate()
-    for k, v in results.items():
-        print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+    # Final evaluation on test set
+    print("\n\n" + "#" * 60)
+    print(f"# FINAL TEST SET EVALUATION")
+    print(f"# Model: {model_name}")
+    print(f"# Dataset: {dataset_name}")
+    print("#" * 60)
 
     preds_output = trainer.predict(val_dataset)
-    detailed_report(preds_output.predictions, preds_output.label_ids, va_sw, va_tw)
+    test_results = detailed_report(preds_output.predictions, preds_output.label_ids, va_sw, va_tw)
+
+    # Save results to file
+    results_path = os.path.join(output_dir, "test_results.json")
+    with open(results_path, "w") as f:
+        json.dump(test_results, f, indent=2)
+    print(f"\nResults saved to {results_path}")
 
     return trainer, tokenizer
 
