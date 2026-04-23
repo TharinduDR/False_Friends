@@ -248,6 +248,63 @@ def _macro_f1_token(flat_true, flat_pred):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Weighted Trainer — upweight rare B-FF class
+# ──────────────────────────────────────────────────────────────────────────────
+class WeightedTrainer(Trainer):
+    """Custom Trainer that applies class weights to the cross-entropy loss,
+    giving more importance to the rare B-FF label."""
+
+    def __init__(self, class_weights=None, **kwargs):
+        super().__init__(**kwargs)
+        if class_weights is not None:
+            self.class_weights = torch.tensor(class_weights, dtype=torch.float)
+        else:
+            self.class_weights = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        if self.class_weights is not None:
+            weight = self.class_weights.to(logits.device)
+            loss_fn = torch.nn.CrossEntropyLoss(weight=weight, ignore_index=-100)
+        else:
+            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+        loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+
+def _compute_class_weights(label_lists, ff_weight=None):
+    """Compute class weights from label data.
+    If ff_weight is given, use [1.0, ff_weight].
+    Otherwise, compute inverse frequency weights automatically."""
+    if ff_weight is not None:
+        weights = [1.0, ff_weight]
+        print(f"  Class weights: O={weights[0]:.1f}, B-FF={weights[1]:.1f} (manual)")
+        return weights
+
+    # Auto-compute from label distribution
+    counts = {0: 0, 1: 0}
+    for labels in label_lists:
+        for l in labels:
+            lid = l if isinstance(l, int) else LABEL2ID.get(l, 0)
+            counts[lid] += 1
+
+    total = counts[0] + counts[1]
+    if counts[1] == 0:
+        weights = [1.0, 1.0]
+    else:
+        # Inverse frequency, normalised so O=1.0
+        weights = [1.0, counts[0] / counts[1]]
+
+    print(f"  Label distribution: O={counts[0]}, B-FF={counts[1]}")
+    print(f"  Class weights: O={weights[0]:.1f}, B-FF={weights[1]:.1f} (auto)")
+    return weights
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Train
 # ──────────────────────────────────────────────────────────────────────────────
 def train_model(
@@ -262,6 +319,7 @@ def train_model(
     max_length=512,
     seed=42,
     early_stopping_patience=3,
+    ff_weight=None,
     hf_token=None,
 ):
     """
@@ -279,6 +337,9 @@ def train_model(
         max_length:    Max sequence length (source + target combined)
         seed:          Random seed
         early_stopping_patience: Early stopping patience (0 to disable)
+        ff_weight:     Weight for B-FF class in loss (default: None = auto-compute
+                       from inverse frequency). Set e.g. 10.0, 20.0, 50.0 to manually
+                       control how much the model focuses on false friends.
         hf_token:      HuggingFace token for private datasets
 
     Returns:
@@ -301,6 +362,10 @@ def train_model(
     train_dataset = FalseFriendPairDataset(tr_sw, tr_sl, tr_tw, tr_tl, tokenizer, max_length)
     val_dataset = FalseFriendPairDataset(va_sw, va_sl, va_tw, va_tl, tokenizer, max_length)
     data_collator = DataCollatorForTokenClassification(tokenizer, padding=True)
+
+    # Compute class weights for imbalanced B-FF label
+    all_train_labels = list(tr_sl) + list(tr_tl)
+    class_weights = _compute_class_weights(all_train_labels, ff_weight=ff_weight)
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -326,7 +391,8 @@ def train_model(
     if early_stopping_patience > 0:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=early_stopping_patience))
 
-    trainer = Trainer(
+    trainer = WeightedTrainer(
+        class_weights=class_weights,
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -531,6 +597,9 @@ def main():
     tp.add_argument("--max_length", type=int, default=512)
     tp.add_argument("--seed", type=int, default=42)
     tp.add_argument("--early_stopping_patience", type=int, default=3)
+    tp.add_argument("--ff_weight", type=float, default=None,
+                    help="Weight for B-FF class in loss. Default: auto-compute from inverse frequency. "
+                         "Try 10, 20, or 50 to upweight false friends.")
     tp.add_argument("--hf_token", type=str, default=None)
 
     # --- Predict ---
@@ -561,6 +630,7 @@ def main():
             max_length=args.max_length,
             seed=args.seed,
             early_stopping_patience=args.early_stopping_patience,
+            ff_weight=args.ff_weight,
             hf_token=args.hf_token,
         )
     elif args.command == "predict":
